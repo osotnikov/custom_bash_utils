@@ -1,0 +1,96 @@
+add_path() {
+    local UPDATE_SUDO=1
+    local NEW_ENTRY=""
+
+    # 1. Parse arguments for --no-sudo flag
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-sudo)
+                UPDATE_SUDO=0
+                shift
+                ;;
+            *)
+                if [ -z "$NEW_ENTRY" ]; then
+                    NEW_ENTRY="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Check for missing argument
+    if [ -z "$NEW_ENTRY" ]; then
+        echo "Usage: add_path [--no-sudo] /path/to/directory"
+        return 1
+    fi
+
+    # Check if directory actually exists
+    if [ ! -d "$NEW_ENTRY" ]; then
+        echo "Warning: '$NEW_ENTRY' is not a valid directory."
+        return 1
+    fi
+
+    # 2. Read current PATH from /etc/environment
+    local CURRENT_PATH
+    CURRENT_PATH=$(sed -n 's/^PATH="\(.*\)"$/\1/p' /etc/environment)
+
+    local PATH_ARRAY
+    IFS=':' read -ra PATH_ARRAY <<< "$CURRENT_PATH"
+    for dir in "${PATH_ARRAY[@]}"; do
+        if [[ "$dir" == "$NEW_ENTRY" ]]; then
+            echo "Path '$NEW_ENTRY' is already in /etc/environment"
+            return 0
+        fi
+    done
+
+    # 3. Update /etc/environment
+    echo "Updating /etc/environment..."
+    sudo sed -i "s|^PATH=\"|PATH=\"${NEW_ENTRY}:|" /etc/environment
+
+    # 4. Update sudoers secure_path (unless --no-sudo is specified)
+    if [ "$UPDATE_SUDO" -eq 1 ]; then
+        local CURRENT_SECURE_PATH
+        CURRENT_SECURE_PATH=$(sudo visudo -c -f /etc/sudoers >/dev/null 2>&1 && sudo grep -E '^\s*Defaults\s+secure_path\s*=' /etc/sudoers | sed -E 's/.*secure_path="?([^"]*)"?/\1/')
+
+        # Check if entry is already in secure_path
+        local SECURE_ARRAY
+        local IS_IN_SECURE=0
+        IFS=':' read -ra SECURE_ARRAY <<< "$CURRENT_SECURE_PATH"
+        for dir in "${SECURE_ARRAY[@]}"; do
+            if [[ "$dir" == "$NEW_ENTRY" ]]; then
+                IS_IN_SECURE=1
+                break
+            fi
+        done
+
+        if [ "$IS_IN_SECURE" -eq 0 ]; then
+            echo "Updating sudoers secure_path..."
+            # Use /etc/sudoers.d/ path override to avoid safely editing main /etc/sudoers directly
+            local SUDOERS_FILE="/etc/sudoers.d/custom_secure_path"
+            local NEW_SECURE_PATH="${NEW_ENTRY}:${CURRENT_SECURE_PATH}"
+            
+            # Write to a temp file, validate with visudo, and apply
+            echo "Defaults secure_path=\"${NEW_SECURE_PATH}\"" | sudo tee "${SUDOERS_FILE}.tmp" >/dev/null
+            if sudo visudo -cf "${SUDOERS_FILE}.tmp" >/dev/null 2>&1; then
+                sudo chmod 0440 "${SUDOERS_FILE}.tmp"
+                sudo mv "${SUDOERS_FILE}.tmp" "$SUDOERS_FILE"
+            else
+                echo "Error: Generated invalid sudoers configuration. Aborting sudoers update."
+                sudo rm -f "${SUDOERS_FILE}.tmp"
+            fi
+        else
+            echo "Path '$NEW_ENTRY' is already in sudoers secure_path."
+        fi
+    fi
+
+    # 5. Reload current shell environment
+    set -a; source /etc/environment; set +a
+
+    # 6. Update tmux global environment (if running inside tmux)
+    if [ -n "$TMUX" ]; then
+        tmux set-environment -g PATH "$PATH"
+        echo "Updated current shell and active tmux server environment."
+    else
+        echo "Updated current shell environment."
+    fi
+}
